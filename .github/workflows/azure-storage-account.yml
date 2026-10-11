@@ -1,0 +1,127 @@
+name: Create Azure storage account
+run-name: Create storage account ${{ inputs.storageAccountName }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      subscriptionId:
+        description: Existing Azure subscription ID
+        required: true
+        type: string
+      resourceGroupName:
+        description: Existing resource group name
+        required: true
+        type: string
+      region:
+        description: Azure region for the storage account
+        required: true
+        type: string
+      storageAccountName:
+        description: Globally unique name (3-24 lowercase letters and numbers)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    env:
+      TARGET_SUBSCRIPTION_ID: ${{ inputs.subscriptionId }}
+      RESOURCE_GROUP_NAME: ${{ inputs.resourceGroupName }}
+      REGION: ${{ inputs.region }}
+      STORAGE_ACCOUNT_NAME: ${{ inputs.storageAccountName }}
+    steps:
+      - name: Validate inputs
+        shell: bash
+        run: |
+          if [[ ! "$TARGET_SUBSCRIPTION_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+            echo "::error::Subscription ID must be a GUID."
+            exit 1
+          fi
+          if [[ ! "$STORAGE_ACCOUNT_NAME" =~ ^[a-z0-9]{3,24}$ ]]; then
+            echo "::error::Storage account names must be 3-24 lowercase letters or numbers."
+            exit 1
+          fi
+          if [[ -z "$RESOURCE_GROUP_NAME" || ${#RESOURCE_GROUP_NAME} -gt 90 ]]; then
+            echo "::error::Provide an existing resource group name (maximum 90 characters)."
+            exit 1
+          fi
+          if [[ ! "$REGION" =~ ^[a-z0-9]+([a-z0-9-]*[a-z0-9])?$ ]]; then
+            echo "::error::Region must be an Azure region name, such as eastus."
+            exit 1
+          fi
+
+      - name: Check out provisioning files
+        uses: actions/checkout@v4
+
+      - name: Sign in to Azure with GitHub OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ inputs.subscriptionId }}
+
+      - name: Validate subscription and existing resource group
+        shell: bash
+        run: |
+          ACTUAL_SUBSCRIPTION_ID=$(az account show --query id --output tsv)
+          if [[ "${ACTUAL_SUBSCRIPTION_ID,,}" != "${TARGET_SUBSCRIPTION_ID,,}" ]]; then
+            echo "::error::Azure CLI is not using the requested subscription."
+            exit 1
+          fi
+          if ! az group show \
+            --name "$RESOURCE_GROUP_NAME" \
+            --subscription "$TARGET_SUBSCRIPTION_ID" \
+            --only-show-errors \
+            --output none; then
+            echo "::error::The resource group must already exist in the requested subscription."
+            exit 1
+          fi
+          if az storage account show \
+            --name "$STORAGE_ACCOUNT_NAME" \
+            --resource-group "$RESOURCE_GROUP_NAME" \
+            --subscription "$TARGET_SUBSCRIPTION_ID" \
+            --only-show-errors \
+            --output none 2>/dev/null; then
+            echo "::error::A storage account with this name already exists in the target resource group; refusing to modify it."
+            exit 1
+          fi
+
+      - name: Preview storage account deployment
+        run: |
+          az deployment group what-if \
+            --name "storage-${STORAGE_ACCOUNT_NAME}" \
+            --resource-group "$RESOURCE_GROUP_NAME" \
+            --subscription "$TARGET_SUBSCRIPTION_ID" \
+            --template-file infra/storage-account.bicep \
+            --parameters \
+              storageAccountName="$STORAGE_ACCOUNT_NAME" \
+              location="$REGION" \
+            --only-show-errors
+
+      - name: Create storage account
+        id: deploy
+        run: |
+          az deployment group create \
+            --name "storage-${STORAGE_ACCOUNT_NAME}" \
+            --resource-group "$RESOURCE_GROUP_NAME" \
+            --subscription "$TARGET_SUBSCRIPTION_ID" \
+            --template-file infra/storage-account.bicep \
+            --parameters \
+              storageAccountName="$STORAGE_ACCOUNT_NAME" \
+              location="$REGION" \
+            --only-show-errors \
+            --output json > deployment-result.json
+          STORAGE_ACCOUNT_ID=$(jq -r '.properties.outputs.storageAccountId.value' deployment-result.json)
+          echo "storageAccountId=$STORAGE_ACCOUNT_ID" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Storage account created"
+            echo "- Subscription: \`$TARGET_SUBSCRIPTION_ID\`"
+            echo "- Resource group: \`$RESOURCE_GROUP_NAME\`"
+            echo "- Region: \`$REGION\`"
+            echo "- Storage account: \`$STORAGE_ACCOUNT_NAME\`"
+            echo "- Resource ID: \`$STORAGE_ACCOUNT_ID\`"
+          } >> "$GITHUB_STEP_SUMMARY"
