@@ -1,0 +1,125 @@
+name: Azure subscription vending
+run-name: Azure subscription ${{ inputs.requestKey }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      requestKey:
+        description: Unique request key
+        required: true
+        type: string
+      applicationName:
+        description: Application name
+        required: true
+        type: string
+      businessUnit:
+        description: Business unit
+        required: true
+        type: string
+      environment:
+        description: Environment (sandbox, dev, test, prod)
+        required: true
+        type: string
+      ownerEmail:
+        description: Owner email
+        required: true
+        type: string
+      costCenter:
+        description: Cost center
+        required: true
+        type: string
+      targetManagementGroup:
+        description: Management group ID for the new subscription
+        required: true
+        type: string
+      region:
+        description: Primary Azure region
+        required: true
+        type: string
+      dataClassification:
+        description: Data classification
+        required: true
+        type: string
+      connectivity:
+        description: Connectivity model
+        required: true
+        type: string
+      estimatedMonthlySpendGbp:
+        description: Estimated monthly spend in GBP
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  vend:
+    runs-on: ubuntu-latest
+    env:
+      REQUEST_KEY: ${{ inputs.requestKey }}
+      APPLICATION_NAME: ${{ inputs.applicationName }}
+      BUSINESS_UNIT: ${{ inputs.businessUnit }}
+      ENVIRONMENT: ${{ inputs.environment }}
+      OWNER_EMAIL: ${{ inputs.ownerEmail }}
+      COST_CENTER: ${{ inputs.costCenter }}
+      TARGET_MANAGEMENT_GROUP: ${{ inputs.targetManagementGroup }}
+      REGION: ${{ inputs.region }}
+      DATA_CLASSIFICATION: ${{ inputs.dataClassification }}
+      CONNECTIVITY: ${{ inputs.connectivity }}
+      ESTIMATED_MONTHLY_SPEND_GBP: ${{ inputs.estimatedMonthlySpendGbp }}
+    steps:
+      - name: Validate request key
+        run: |
+          if [[ ! "$REQUEST_KEY" =~ ^[a-z0-9-]+$ ]]; then
+            echo "Invalid request key: $REQUEST_KEY"
+            exit 1
+          fi
+
+      - name: Save request record
+        run: |
+          mkdir -p "requests/azure/$REQUEST_KEY"
+          jq -n \
+            --arg requestKey "$REQUEST_KEY" \
+            --arg applicationName "$APPLICATION_NAME" \
+            --arg businessUnit "$BUSINESS_UNIT" \
+            --arg environment "$ENVIRONMENT" \
+            --arg ownerEmail "$OWNER_EMAIL" \
+            --arg costCenter "$COST_CENTER" \
+            --arg managementGroup "$TARGET_MANAGEMENT_GROUP" \
+            --arg region "$REGION" \
+            --arg dataClassification "$DATA_CLASSIFICATION" \
+            --arg connectivity "$CONNECTIVITY" \
+            --arg spend "$ESTIMATED_MONTHLY_SPEND_GBP" \
+            '{requestKey: $requestKey, applicationName: $applicationName, businessUnit: $businessUnit, environment: $environment, ownerEmail: $ownerEmail, costCenter: $costCenter, targetManagementGroup: $managementGroup, region: $region, dataClassification: $dataClassification, connectivity: $connectivity, estimatedMonthlySpendGbp: $spend}' \
+            > "requests/azure/$REQUEST_KEY/request.json"
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Create subscription alias
+        env:
+          BILLING_SCOPE: ${{ vars.BILLING_SCOPE }}
+        run: |
+          case "$ENVIRONMENT" in
+            prod) WORKLOAD="Production" ;;
+            *) WORKLOAD="DevTest" ;;
+          esac
+          jq -n \
+            --arg displayName "$APPLICATION_NAME-$ENVIRONMENT" \
+            --arg billingScope "$BILLING_SCOPE" \
+            --arg workload "$WORKLOAD" \
+            --arg managementGroup "$TARGET_MANAGEMENT_GROUP" \
+            '{properties: {displayName: $displayName, billingScope: $billingScope, workload: $workload, additionalProperties: {managementGroupId: $managementGroup}}}' \
+            > alias-body.json
+          az rest --method put \
+            --url "https://management.azure.com/providers/Microsoft.Subscription/aliases/$REQUEST_KEY?api-version=2021-10-01" \
+            --body @alias-body.json \
+            --output json > alias-result.json
+          SUBSCRIPTION_ID=$(jq -r '.properties.subscriptionId // empty' alias-result.json)
+          echo "Subscription ID: ${SUBSCRIPTION_ID:-pending}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Request key: $REQUEST_KEY" >> "$GITHUB_STEP_SUMMARY"
